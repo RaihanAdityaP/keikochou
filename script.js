@@ -17,6 +17,7 @@ const STORAGE_KEY = "keikochou_progress_v1";
 const SERVER_TIME_API = "https://worldtimeapi.org/api/ip";
 const DEFAULT_THEME = "light";
 const DEFAULT_LANG = "id";
+const MASTERY_MAX = 5;
 
 const STRINGS = {
   id: {
@@ -29,7 +30,7 @@ const STRINGS = {
     themeButton: "Tema",
     earnedXp: "XP diperoleh",
     level: "Level",
-    autoMastered: "Item berhasil dikuasai lewat kuis",
+    autoMastered: "Progress mastery diperbarui lewat kuis",
     congratulations: "Selamat!",
     currentMission: "Misi saat ini",
     trackingDay: "Hari ini",
@@ -71,7 +72,7 @@ const STRINGS = {
     themeButton: "Theme",
     earnedXp: "XP earned",
     level: "Level",
-    autoMastered: "Items auto-mastered from quiz",
+    autoMastered: "Mastery progress updated from quiz",
     congratulations: "Nice!",
     currentMission: "Current mission",
     trackingDay: "Today",
@@ -157,7 +158,8 @@ const state = {
   masteredKanji: new Set(),
   masteredPhrases: new Set(),
   masteredKana: new Set(),
-  quiz: { track:null, level:null, questions:[], currentIndex:0, score:0, answered:false },
+  masteryProgress: {},
+  quiz: { track:null, level:null, questions:[], currentIndex:0, score:0, answered:false, completed:false },
   modalContext: null, // { kind: 'kanji'|'kana', key, level, idx }
   language: DEFAULT_LANG,
   theme: DEFAULT_THEME,
@@ -185,6 +187,7 @@ function loadProgress(){
     if (Array.isArray(saved.masteredKanji)) state.masteredKanji = new Set(saved.masteredKanji);
     if (Array.isArray(saved.masteredPhrases)) state.masteredPhrases = new Set(saved.masteredPhrases);
     if (Array.isArray(saved.masteredKana)) state.masteredKana = new Set(saved.masteredKana);
+    if (saved.masteryProgress && typeof saved.masteryProgress === 'object') state.masteryProgress = saved.masteryProgress;
     if (saved.language) state.language = saved.language;
     if (saved.theme) state.theme = saved.theme;
     if (typeof saved.streakCount === 'number') state.streakCount = saved.streakCount;
@@ -201,6 +204,7 @@ function loadProgress(){
     state.freezeTokens = state.freezeTokenDates.length;
     if (Array.isArray(saved.dailyMissions)) state.dailyMissions = saved.dailyMissions;
   }
+  migrateMasteredSetsToProgress();
 }
 
 function persistProgress(){
@@ -209,6 +213,7 @@ function persistProgress(){
     masteredKanji: [...state.masteredKanji],
     masteredPhrases: [...state.masteredPhrases],
     masteredKana: [...state.masteredKana],
+    masteryProgress: state.masteryProgress,
     language: state.language,
     theme: state.theme,
     streakCount: state.streakCount,
@@ -230,16 +235,98 @@ function kanjiKey(level, idx){ return `${level}::kanji::${idx}`; }
 function phraseKey(level, idx){ return `${level}::phrase::${idx}`; }
 function kanaKey(type, group, idx){ return `${type}::${group}::${idx}`; }
 
+function getMasteredSet(type){
+  if (type === 'kana') return state.masteredKana;
+  if (type === 'vocab') return state.masteredVocab;
+  if (type === 'kanji') return state.masteredKanji;
+  if (type === 'phrase') return state.masteredPhrases;
+  return null;
+}
+
+function inferMasteryTypeFromKey(key){
+  if (!key) return null;
+  if (key.includes('::kana::') || key.startsWith('hiragana::') || key.startsWith('katakana::')) return 'kana';
+  if (key.includes('::vocab::')) return 'vocab';
+  if (key.includes('::kanji::')) return 'kanji';
+  if (key.includes('::phrase::')) return 'phrase';
+  return null;
+}
+
+function getMasteryStrength(key, type){
+  if (!key) return 0;
+  const saved = Number(state.masteryProgress[key]);
+  if (Number.isFinite(saved)) return Math.max(0, Math.min(MASTERY_MAX, saved));
+  const set = getMasteredSet(type || inferMasteryTypeFromKey(key));
+  return set && set.has(key) ? MASTERY_MAX : 0;
+}
+
+function setMasteryStrength(key, type, value){
+  if (!key) return { before:0, after:0, masteredNow:false, lostMastery:false };
+  const itemType = type || inferMasteryTypeFromKey(key);
+  const before = getMasteryStrength(key, itemType);
+  const after = Math.max(0, Math.min(MASTERY_MAX, Number(value) || 0));
+  state.masteryProgress[key] = after;
+  const set = getMasteredSet(itemType);
+  if (set){
+    if (after >= MASTERY_MAX) set.add(key);
+    else set.delete(key);
+  }
+  return {
+    before,
+    after,
+    masteredNow: before < MASTERY_MAX && after >= MASTERY_MAX,
+    lostMastery: before >= MASTERY_MAX && after < MASTERY_MAX
+  };
+}
+
+function adjustMasteryStrength(key, type, delta){
+  return setMasteryStrength(key, type, getMasteryStrength(key, type) + delta);
+}
+
+function isItemMastered(key, type){
+  return getMasteryStrength(key, type) >= MASTERY_MAX;
+}
+
+function getMasteryText(key, type){
+  return `${getMasteryStrength(key, type)}/${MASTERY_MAX}`;
+}
+
+function getMasteryPercent(keys, type){
+  if (!keys.length) return 0;
+  const totalStrength = keys.reduce((sum, key) => sum + getMasteryStrength(key, type), 0);
+  return Math.round((totalStrength / (keys.length * MASTERY_MAX)) * 100);
+}
+
+function countMasteredKeys(keys, type){
+  return keys.filter(key => isItemMastered(key, type)).length;
+}
+
+function migrateMasteredSetsToProgress(){
+  [
+    ['kana', state.masteredKana],
+    ['vocab', state.masteredVocab],
+    ['kanji', state.masteredKanji],
+    ['phrase', state.masteredPhrases]
+  ].forEach(([type, set]) => {
+    set.forEach(key => {
+      if (state.masteryProgress[key] === undefined) state.masteryProgress[key] = MASTERY_MAX;
+      setMasteryStrength(key, type, state.masteryProgress[key]);
+    });
+  });
+}
+
 function totalMasteredCount(){
   return state.masteredVocab.size + state.masteredKanji.size + state.masteredPhrases.size + state.masteredKana.size;
 }
 
 function updateMasteredBadge(){
-  document.getElementById("masteredCount").textContent = totalMasteredCount();
+  const badge = document.getElementById("masteredCount");
+  if (badge) badge.textContent = totalMasteredCount();
 }
 
 function showToast(msg){
   const t = document.getElementById("toast");
+  if (!t) return;
   t.textContent = msg;
   t.classList.add("show");
   clearTimeout(window._toastTimer);
@@ -938,39 +1025,39 @@ function renderReviewItems(){
     ['main','dakuten','combo'].forEach(group => {
       data[group].forEach((item, idx) => {
         const key = kanaKey(state.currentKanaType, group, idx);
-        if (!state.masteredKana.has(key)) items.push({ label:item[0], sub:item[1], type:'kana', key });
+        if (!isItemMastered(key, 'kana')) items.push({ label:item[0], sub:item[1], type:'kana', key });
       });
     });
   } else if (state.currentTrack === 'jlpt' && state.currentJLPTLevel){
     const lvl = JLPT_DATA[state.currentJLPTLevel];
     lvl.vocab.forEach((item, idx) => {
       const key = vocabKey(state.currentJLPTLevel, idx);
-      if (!state.masteredVocab.has(key)) items.push({ label:item[1] || item[0], sub:localizeMeaning(item[2]), type:'vocab', key });
+      if (!isItemMastered(key, 'vocab')) items.push({ label:item[1] || item[0], sub:localizeMeaning(item[2]), type:'vocab', key });
     });
     lvl.kanji.forEach((item, idx) => {
       const key = kanjiKey(state.currentJLPTLevel, idx);
-      if (!state.masteredKanji.has(key)) items.push({ label:item[0], sub:localizeMeaning(item[2]), type:'kanji', key });
+      if (!isItemMastered(key, 'kanji')) items.push({ label:item[0], sub:localizeMeaning(item[2]), type:'kanji', key });
     });
   } else if (state.currentTrack === 'jft' && state.currentJFTCategory){
     const cat = JFT_DATA.categories[state.currentJFTCategory];
     cat.items.forEach((item, idx) => {
       const key = phraseKey('jft_'+state.currentJFTCategory, idx);
-      if (!state.masteredPhrases.has(key)) items.push({ label:item.jp, sub:localizeMeaning(item.id), type:'phrase', key });
+      if (!isItemMastered(key, 'phrase')) items.push({ label:item.jp, sub:localizeMeaning(item.id), type:'phrase', key });
     });
   } else if (state.currentTrack === 'listening' && state.currentListeningLevel){
     const lvl = LISTENING_DATA[state.currentListeningLevel];
     lvl.phrases.forEach((item, idx) => {
       const key = phraseKey(state.currentListeningLevel, idx);
-      if (!state.masteredPhrases.has(key)) items.push({ label:item[0], sub:localizeMeaning(item[1]), type:'phrase', key });
+      if (!isItemMastered(key, 'phrase')) items.push({ label:item[0], sub:localizeMeaning(item[1]), type:'phrase', key });
     });
   } else {
     HIRAGANA.combo.forEach((item, idx) => {
       const key = kanaKey('hiragana','combo',idx);
-      if (!state.masteredKana.has(key)) items.push({ label:item[0], sub:item[1], type:'kana', key });
+      if (!isItemMastered(key, 'kana')) items.push({ label:item[0], sub:item[1], type:'kana', key });
     });
     KATAKANA.combo.forEach((item, idx) => {
       const key = kanaKey('katakana','combo',idx);
-      if (!state.masteredKana.has(key)) items.push({ label:item[0], sub:item[1], type:'kana', key });
+      if (!isItemMastered(key, 'kana')) items.push({ label:item[0], sub:item[1], type:'kana', key });
     });
   }
   const reviewContainer = document.getElementById('reviewItems');
@@ -983,7 +1070,16 @@ function renderReviewItems(){
     const div = document.createElement('div');
     div.className = 'review-item';
     const left = document.createElement('div');
-    left.innerHTML = `<div class="item-label">${escapeHtml(item.label)}</div><div class="item-sub">${escapeHtml(item.sub)}</div>`;
+    const strength = getMasteryStrength(item.key, item.type);
+    const strengthPct = (strength / MASTERY_MAX) * 100;
+    left.innerHTML = `
+      <div class="item-label">${escapeHtml(item.label)}</div>
+      <div class="item-sub">${escapeHtml(item.sub)}</div>
+      <div class="mastery-meter" aria-label="Mastery ${strength}/${MASTERY_MAX}">
+        <div style="width:${strengthPct}%"></div>
+      </div>
+      <div class="mastery-text">${getMasteryText(item.key, item.type)}</div>
+    `;
     
     const buttonContainer = document.createElement('div');
     buttonContainer.style.display = 'flex';
@@ -997,8 +1093,6 @@ function renderReviewItems(){
     const markButton = document.createElement('button');
     markButton.className = 'mark-button';
     markButton.textContent = `${getString('masterButton')} ✓`;
-    markButton.textContent = 'Kuasai ✓';
-    markButton.textContent = `${getString('masterButton')} ✓`;
     markButton.addEventListener('click', () => markReviewItemMastered(item));
     
     div.appendChild(left);
@@ -1010,19 +1104,31 @@ function renderReviewItems(){
 }
 
 function markReviewItemMastered(item){
-  if (item.key){
-    if (item.type === 'kana') state.masteredKana.add(item.key);
-    else if (item.type === 'vocab') state.masteredVocab.add(item.key);
-    else if (item.type === 'kanji') state.masteredKanji.add(item.key);
-    else if (item.type === 'phrase') state.masteredPhrases.add(item.key);
-  }
+  const result = adjustMasteryStrength(item.key, item.type, 1);
   persistProgress();
   updateMasteredBadge();
   state.reviewProgressAllowed = true;
   handleReviewProgress();
   state.reviewProgressAllowed = false;
   renderReviewItems();
-  showToast(state.language === 'en' ? `${item.label} mastered!` : `${item.label} dikuasai!`);
+  if (result.masteredNow){
+    showToast(state.language === 'en' ? `${item.label} mastered!` : `${item.label} dikuasai!`);
+  } else {
+    showToast(state.language === 'en'
+      ? `${item.label} progress ${result.after}/${MASTERY_MAX}`
+      : `Progress ${item.label} ${result.after}/${MASTERY_MAX}`);
+  }
+}
+
+function toggleManualMastery(key, type, container){
+  const wasMastered = isItemMastered(key, type);
+  setMasteryStrength(key, type, wasMastered ? 0 : MASTERY_MAX);
+  if (container) container.classList.toggle("learned", !wasMastered);
+  updateMasteredBadge();
+  persistProgress();
+  showToast(!wasMastered
+    ? (state.language === 'en' ? "Marked as mastered ✓" : "Ditandai dikuasai ✓")
+    : (state.language === 'en' ? "Mastery mark removed" : "Tanda dikuasai dihapus"));
 }
 
 function focusReviewItem(label){
@@ -1041,12 +1147,7 @@ function handleQuizCompletion(){
 }
 
 function addAutoMasterKey(key){
-  if (!state.masteredKana.has(key) && !state.masteredVocab.has(key) && !state.masteredKanji.has(key) && !state.masteredPhrases.has(key)){
-    if (key.includes('kana::')) state.masteredKana.add(key);
-    else if (key.includes('kanji::')) state.masteredKanji.add(key);
-    else if (key.includes('vocab::')) state.masteredVocab.add(key);
-    else if (key.includes('phrase::')) state.masteredPhrases.add(key);
-  }
+  setMasteryStrength(key, inferMasteryTypeFromKey(key), MASTERY_MAX);
 }
 
 function autoMasterQuizItem(item){
@@ -1057,12 +1158,8 @@ function autoMasterQuizItem(item){
 }
 
 function autoMasterQuizResults(){
-  state.quiz.questions.forEach(q => {
-    if (q.correctlyAnswered && q.masterKey){
-      autoMasterQuizItem(q);
-    }
-  });
   persistProgress();
+  updateMasteredBadge();
 }
 
 function awardQuizRewards(){
@@ -1169,18 +1266,39 @@ function shuffle(arr){
 }
 
 // ---------- Text to speech ----------
+let japaneseVoices = [];
+
+function loadJapaneseVoices(){
+  if (!('speechSynthesis' in window)) return [];
+  const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
+  japaneseVoices = voices.filter(v => v.lang && v.lang.toLowerCase().startsWith("ja"));
+  return japaneseVoices;
+}
+
+function primeSpeechSynthesis(){
+  loadJapaneseVoices();
+}
+
+if ('speechSynthesis' in window){
+  window.speechSynthesis.onvoiceschanged = loadJapaneseVoices;
+  document.addEventListener('pointerdown', primeSpeechSynthesis, { once:true });
+  document.addEventListener('touchstart', primeSpeechSynthesis, { once:true });
+}
+
 function speakJapanese(text, rate){
   try{
     if (!('speechSynthesis' in window)) { showToast("Text-to-speech tidak didukung di browser ini"); return; }
     window.speechSynthesis.cancel();
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = "ja-JP";
-    const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
-    const jpVoice = voices.find(v => v.lang && v.lang.toLowerCase().startsWith("ja"));
+    const voices = japaneseVoices.length ? japaneseVoices : loadJapaneseVoices();
+    const jpVoice = voices[0];
     if (jpVoice) utter.voice = jpVoice;
     utter.rate = rate || state.speed || 0.85;
     window.speechSynthesis.speak(utter);
-  }catch(e){ /* ignore */ }
+  }catch(e){
+    showToast(state.language === 'en' ? "Audio could not play on this device" : "Suara belum bisa diputar di perangkat ini");
+  }
 }
 
 function speakWithShadowPause(text, rate, onDone){
@@ -1268,12 +1386,14 @@ function renderKanaOverview(){
   ];
 
   defs.forEach(def => {
-    const total = def.data.main.length + def.data.dakuten.length + def.data.combo.length;
-    let mastered = 0;
-    def.data.main.forEach((_,i)=>{ if(state.masteredKana.has(kanaKey(def.key,"main",i))) mastered++; });
-    def.data.dakuten.forEach((_,i)=>{ if(state.masteredKana.has(kanaKey(def.key,"dakuten",i))) mastered++; });
-    def.data.combo.forEach((_,i)=>{ if(state.masteredKana.has(kanaKey(def.key,"combo",i))) mastered++; });
-    const pct = total ? Math.round((mastered/total)*100) : 0;
+    const keys = [
+      ...def.data.main.map((_,i)=>kanaKey(def.key,"main",i)),
+      ...def.data.dakuten.map((_,i)=>kanaKey(def.key,"dakuten",i)),
+      ...def.data.combo.map((_,i)=>kanaKey(def.key,"combo",i))
+    ];
+    const total = keys.length;
+    const mastered = countMasteredKeys(keys, 'kana');
+    const pct = getMasteryPercent(keys, 'kana');
     const isMastered = pct === 100;
 
     const card = document.createElement("button");
@@ -1295,11 +1415,13 @@ function renderJLPTOverview(){
   grid.innerHTML = "";
   JLPT_ORDER.forEach(levelKey => {
     const lvl = JLPT_DATA[levelKey];
-    const totalItems = lvl.vocab.length + lvl.kanji.length;
-    let masteredItems = 0;
-    lvl.vocab.forEach((_,i) => { if(state.masteredVocab.has(vocabKey(levelKey,i))) masteredItems++; });
-    lvl.kanji.forEach((_,i) => { if(state.masteredKanji.has(kanjiKey(levelKey,i))) masteredItems++; });
-    const pct = totalItems ? Math.round((masteredItems/totalItems)*100) : 0;
+    const vocabKeys = lvl.vocab.map((_,i) => vocabKey(levelKey,i));
+    const kanjiKeys = lvl.kanji.map((_,i) => kanjiKey(levelKey,i));
+    const totalItems = vocabKeys.length + kanjiKeys.length;
+    const masteredItems = countMasteredKeys(vocabKeys, 'vocab') + countMasteredKeys(kanjiKeys, 'kanji');
+    const totalStrength = vocabKeys.reduce((sum, key) => sum + getMasteryStrength(key, 'vocab'), 0)
+      + kanjiKeys.reduce((sum, key) => sum + getMasteryStrength(key, 'kanji'), 0);
+    const pct = totalItems ? Math.round((totalStrength / (totalItems * MASTERY_MAX)) * 100) : 0;
     const isMastered = pct === 100;
 
     const card = document.createElement("button");
@@ -1331,8 +1453,8 @@ function renderJFTOverview(){
   grid.innerHTML = "";
   JFT_ORDER.forEach(catKey => {
     const cat = JFT_DATA.categories[catKey];
-    let mastered = 0;
-    cat.items.forEach((_,i)=>{ if(state.masteredPhrases.has(phraseKey("jft_"+catKey,i))) mastered++; });
+    const keys = cat.items.map((_,i)=>phraseKey("jft_"+catKey,i));
+    const mastered = countMasteredKeys(keys, 'phrase');
     const card = document.createElement("button");
     card.className = "jft-cat-card";
     card.onclick = () => openJFTCategory(catKey);
@@ -1350,10 +1472,10 @@ function renderListeningOverview(){
   grid.innerHTML = "";
   LISTENING_ORDER.forEach(levelKey => {
     const lvl = LISTENING_DATA[levelKey];
-    const total = lvl.phrases.length;
-    let mastered = 0;
-    lvl.phrases.forEach((_,i) => { if(state.masteredPhrases.has(phraseKey(levelKey,i))) mastered++; });
-    const pct = total ? Math.round((mastered/total)*100) : 0;
+    const keys = lvl.phrases.map((_,i) => phraseKey(levelKey,i));
+    const total = keys.length;
+    const mastered = countMasteredKeys(keys, 'phrase');
+    const pct = getMasteryPercent(keys, 'phrase');
     const isMastered = pct === 100;
 
     const card = document.createElement("button");
@@ -1457,7 +1579,7 @@ function renderKanaContent(typeKey){
     data[g.key].forEach((item, idx) => {
       const [char, romaji] = item;
       const key = kanaKey(typeKey, g.key, idx);
-      const learned = state.masteredKana.has(key);
+      const learned = isItemMastered(key, 'kana');
       const card = document.createElement("button");
       card.className = "kana-card" + (learned ? " learned" : "");
       card.innerHTML = `<span class="kn-char">${escapeHtml(char)}</span><span class="kn-romaji">${escapeHtml(romaji)}</span>`;
@@ -1557,11 +1679,9 @@ function renderJLPTContent(){
     lvl.vocab.forEach((item, idx) => {
       const [kana, kanji, indo, romaji] = item;
       const key = vocabKey(levelKey, idx);
-      const learned = state.masteredVocab.has(key);
+      const learned = isItemMastered(key, 'vocab');
       const div = document.createElement("div");
       div.className = "vocab-item" + (learned ? " learned" : "");
-      div.setAttribute("role","button");
-      div.setAttribute("tabindex","0");
       div.innerHTML = `
         <div class="vi-left">
           <div class="vi-jp">
@@ -1571,24 +1691,11 @@ function renderJLPTContent(){
           <div class="vi-id">${escapeHtml(localizeMeaning(indo))}</div>
           <div class="vi-romaji">${escapeHtml(romaji)}</div>
         </div>
-        <div class="vi-check" aria-hidden="true">
+        <button class="mastery-toggle vi-check" type="button" aria-label="${state.language === 'en' ? 'Toggle mastered' : 'Tandai dikuasai'}">
           <svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>
-        </div>
+        </button>
       `;
-      const toggle = () => {
-        if (state.masteredVocab.has(key)){
-          state.masteredVocab.delete(key);
-          div.classList.remove("learned");
-        } else {
-          state.masteredVocab.add(key);
-          div.classList.add("learned");
-          showToast(state.language === 'en' ? "Saved ✓" : "Tersimpan ✓");
-        }
-        updateMasteredBadge();
-        persistProgress();
-      };
-      div.addEventListener("click", toggle);
-      div.addEventListener("keydown", (e)=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); toggle(); } });
+      div.querySelector(".mastery-toggle").addEventListener("click", () => toggleManualMastery(key, 'vocab', div));
       list.appendChild(div);
     });
   }
@@ -1599,7 +1706,7 @@ function renderJLPTContent(){
     lvl.kanji.forEach((item, idx) => {
       const [char, reading] = item;
       const key = kanjiKey(levelKey, idx);
-      const learned = state.masteredKanji.has(key);
+      const learned = isItemMastered(key, 'kanji');
       const card = document.createElement("button");
       card.className = "kanji-card" + (learned ? " learned" : "");
       card.innerHTML = `
@@ -1641,7 +1748,7 @@ function renderJFTPhraseList(catKey){
   const levelKeyForStorage = "jft_" + catKey;
   cat.items.forEach((item, idx) => {
     const key = phraseKey(levelKeyForStorage, idx);
-    const learned = state.masteredPhrases.has(key);
+    const learned = isItemMastered(key, 'phrase');
     const div = document.createElement("div");
     div.className = "phrase-item" + (learned ? " learned" : "");
     div.innerHTML = `
@@ -1655,23 +1762,15 @@ function renderJFTPhraseList(catKey){
       <div class="ph-play" aria-label="Putar audio">
         <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
       </div>
+      <button class="mastery-toggle ph-master" type="button" aria-label="${state.language === 'en' ? 'Toggle mastered' : 'Tandai dikuasai'}">
+        <svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>
+      </button>
     `;
     div.querySelector(".ph-play").addEventListener("click", (e)=>{
       e.stopPropagation();
       speakJapanese(item.jp);
     });
-    div.addEventListener("click", ()=>{
-      if (state.masteredPhrases.has(key)){
-        state.masteredPhrases.delete(key);
-        div.classList.remove("learned");
-      } else {
-        state.masteredPhrases.add(key);
-        div.classList.add("learned");
-        showToast(state.language === 'en' ? "Saved ✓" : "Tersimpan ✓");
-      }
-      updateMasteredBadge();
-      persistProgress();
-    });
+    div.querySelector(".mastery-toggle").addEventListener("click", () => toggleManualMastery(key, 'phrase', div));
     list.appendChild(div);
   });
 }
@@ -1686,7 +1785,7 @@ function renderPhraseList(levelKey){
   lvl.phrases.forEach((item, idx) => {
     const [jp, indo, romaji, tag] = item;
     const key = phraseKey(levelKey, idx);
-    const learned = state.masteredPhrases.has(key);
+    const learned = isItemMastered(key, 'phrase');
     const div = document.createElement("div");
     div.className = "phrase-item" + (learned ? " learned" : "");
     div.innerHTML = `
@@ -1700,6 +1799,9 @@ function renderPhraseList(levelKey){
       <div class="ph-play" aria-label="Putar audio">
         <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
       </div>
+      <button class="mastery-toggle ph-master" type="button" aria-label="${state.language === 'en' ? 'Toggle mastered' : 'Tandai dikuasai'}">
+        <svg viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M5 13l4 4L19 7"/></svg>
+      </button>
     `;
     const playBtn = div.querySelector(".ph-play");
     playBtn.addEventListener("click", (e)=>{
@@ -1708,18 +1810,7 @@ function renderPhraseList(levelKey){
         if (state.shadowMode) showToast(state.language === 'en' ? "Your turn to shadow! 🎙️" : "Giliranmu menirukan! 🎙️");
       });
     });
-    div.addEventListener("click", ()=>{
-      if (state.masteredPhrases.has(key)){
-        state.masteredPhrases.delete(key);
-        div.classList.remove("learned");
-      } else {
-        state.masteredPhrases.add(key);
-        div.classList.add("learned");
-        showToast(state.language === 'en' ? "Saved ✓" : "Tersimpan ✓");
-      }
-      updateMasteredBadge();
-      persistProgress();
-    });
+    div.querySelector(".mastery-toggle").addEventListener("click", () => toggleManualMastery(key, 'phrase', div));
     list.appendChild(div);
   });
 }
@@ -1795,11 +1886,11 @@ function openKanaModal(typeKey, group, idx){
 function refreshModalMasterButton(){
   const ctx = state.modalContext;
   const masterBtn = document.getElementById("modalMasterBtn");
-  const set = ctx.kind === "kanji" ? state.masteredKanji : state.masteredKana;
-  const isMastered = set.has(ctx.key);
+  const itemType = ctx.kind === "kanji" ? "kanji" : "kana";
+  const isMastered = isItemMastered(ctx.key, itemType);
   masterBtn.textContent = isMastered
     ? (state.language === 'en' ? "✓ Mastered" : "✓ Sudah Dikuasai")
-    : (state.language === 'en' ? "Mark as Mastered" : "Tandai Sudah Dikuasai");
+    : (state.language === 'en' ? `Mark as Mastered (${getMasteryText(ctx.key, itemType)})` : `Tandai Dikuasai (${getMasteryText(ctx.key, itemType)})`);
   masterBtn.classList.toggle("is-active", isMastered);
 }
 
@@ -1826,11 +1917,11 @@ function closeModalOutside(e){ if (e.target.id === "kanjiModal") closeModal(); }
 
 function toggleMastered(){
   const ctx = state.modalContext;
-  const set = ctx.kind === "kanji" ? state.masteredKanji : state.masteredKana;
-  if (set.has(ctx.key)){
-    set.delete(ctx.key);
+  const itemType = ctx.kind === "kanji" ? "kanji" : "kana";
+  if (isItemMastered(ctx.key, itemType)){
+    setMasteryStrength(ctx.key, itemType, 0);
   } else {
-    set.add(ctx.key);
+    setMasteryStrength(ctx.key, itemType, MASTERY_MAX);
     const label = ctx.kind === "kanji" ? "Kanji" : (state.language === 'en' ? "Character" : "Aksara");
     showToast(label + (state.language === 'en' ? " mastered ✓" : " dikuasai ✓"));
   }
@@ -1943,7 +2034,7 @@ function startQuiz(track){
   state.quiz = {
     track,
     level: track === "jlpt" ? state.currentJLPTLevel : track === "listening" ? state.currentListeningLevel : state.currentKanaType,
-    questions, currentIndex:0, score:0, answered:false
+    questions, currentIndex:0, score:0, answered:false, completed:false
   };
 
   document.getElementById("quizTitle").textContent = title;
@@ -1966,10 +2057,13 @@ function renderQuizQuestion(){
       <div class="qq-label">${escapeHtml(q.label)} (${state.quiz.currentIndex+1}/${total})</div>
       <div class="qq-jp">${escapeHtml(q.jp)}</div>
       ${q.sub ? `<div class="qq-sub">${escapeHtml(q.sub)}</div>` : ""}
-      ${q.playable ? `<div style="margin-top:10px;"><button onclick="speakJapanese('${q.jp.replace(/'/g,"\\'")}', state.speed)" style="background:var(--indigo); color:#fff; border:none; padding:8px 16px; border-radius:10px; font-weight:700; cursor:pointer; font-size:12px;">🔊 ${state.language === 'en' ? 'Play Again' : 'Putar Lagi'}</button></div>` : ""}
+      ${q.playable ? `<div style="margin-top:10px;"><button id="quizPlayButton" style="background:var(--indigo); color:#fff; border:none; padding:8px 16px; border-radius:10px; font-weight:700; cursor:pointer; font-size:12px;">🔊 ${state.language === 'en' ? 'Play Audio' : 'Putar Audio'}</button></div>` : ""}
     </div>
     <div class="quiz-options" id="quizOptions"></div>
   `;
+
+  const playButton = document.getElementById("quizPlayButton");
+  if (playButton) playButton.onclick = () => speakJapanese(q.jp, state.speed);
 
   const optionsContainer = document.getElementById("quizOptions");
   q.options.forEach(opt => {
@@ -1982,8 +2076,6 @@ function renderQuizQuestion(){
   });
 
   state.quiz.answered = false;
-
-  if (q.playable) speakJapanese(q.jp, state.speed);
 }
 
 function handleQuizAnswer(selected, correct){
@@ -1992,6 +2084,19 @@ function handleQuizAnswer(selected, correct){
 
   const currentQuestion = state.quiz.questions[state.quiz.currentIndex];
   currentQuestion.correctlyAnswered = selected === correct;
+  if (!currentQuestion.masteryDeltaApplied && currentQuestion.masterKey){
+    const result = adjustMasteryStrength(
+      currentQuestion.masterKey,
+      currentQuestion.type,
+      currentQuestion.correctlyAnswered ? 1 : -1
+    );
+    currentQuestion.masteryDeltaApplied = true;
+    currentQuestion.masteryAfter = result.after;
+    currentQuestion.masteredNow = result.masteredNow;
+    currentQuestion.lostMastery = result.lostMastery;
+    persistProgress();
+    updateMasteredBadge();
+  }
   if (selected === correct) state.quiz.score++;
 
   document.querySelectorAll("#quizOptions .quiz-option").forEach(btn => {
@@ -2022,8 +2127,17 @@ function renderQuizResult(){
   else if (pct >= 50) message = getString('goodQuiz');
   else message = getString('retryQuizMessage');
 
-  autoMasterQuizResults();
-  awardQuizRewards();
+  if (!state.quiz.completed){
+    state.quiz.completed = true;
+    autoMasterQuizResults();
+    awardQuizRewards();
+  }
+  const strengthened = questions.filter(q => q.correctlyAnswered && q.masterKey).length;
+  const weakened = questions.filter(q => q.correctlyAnswered === false && q.masterKey).length;
+  const newlyMastered = questions.filter(q => q.masteredNow).length;
+  const progressSummary = state.language === 'en'
+    ? `Mastery: +${strengthened} strengthened, -${weakened} weakened${newlyMastered ? `, ${newlyMastered} mastered` : ''}.`
+    : `Mastery: +${strengthened} naik, -${weakened} turun${newlyMastered ? `, ${newlyMastered} dikuasai` : ''}.`;
   const quizResultTitle = getString('quizResultTitle');
   const retryButton = getString('retryButton');
   const finishButton = getString('finishButton');
@@ -2033,6 +2147,7 @@ function renderQuizResult(){
       <div class="qr-emoji">${score}/${total}</div>
       <h3>結果 Hasil Kuis ${escapeHtml(String(level))}</h3>
       <p>${escapeHtml(message)}</p>
+      <p>${escapeHtml(progressSummary)}</p>
       <div>
         <button onclick="retryQuiz()">${retryButton}</button>
         <button class="secondary" onclick="exitQuiz()">${finishButton}</button>
@@ -2046,6 +2161,7 @@ function renderQuizResult(){
 function retryQuiz(){ startQuiz(state.quiz.track); }
 
 function exitQuiz(){
+  if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   document.getElementById("quizScreen").classList.remove("active");
   if (state.quiz.track === "jlpt") document.getElementById("detailJLPT").classList.add("active");
   else if (state.quiz.track === "listening") document.getElementById("detailListening").classList.add("active");
